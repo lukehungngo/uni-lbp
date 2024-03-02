@@ -29,6 +29,7 @@ contract LiquidityBootstrappingHooks is BaseHook {
 
     /// Generic pool info used by hooks
     struct LiquidityInfo {
+        // @hung total amount of project token provided (current amount, not total) ???
         uint128 totalAmount; // The total amount of liquidity to provide
         uint32 startTime; // Start time of the liquidity bootstrapping period
         uint32 endTime; // End time of the liquidity bootstrapping period
@@ -68,6 +69,7 @@ contract LiquidityBootstrappingHooks is BaseHook {
     mapping(PoolId => LiquidityInfo) public liquidityInfo;
 
     /// The total amount of liquidity provided to the given pool so far
+    // @hung the liquidity amount will increase over time, this is the liquidity that can be provided (not total amount) at specific time
     /// Note: Represents total of tokens provided as liquidity or sold,
     ///       not just liquidity provided,
     mapping(PoolId => uint256) amountProvided;
@@ -181,9 +183,9 @@ contract LiquidityBootstrappingHooks is BaseHook {
     /// @param key Pool key
     function sync(PoolKey calldata key) public {
         PoolId poolId = key.toId();
-        uint256 timestamp = _floorToEpoch(epochSize[poolId], block.timestamp);
+        uint256 epochTimestamp = _floorToEpoch(epochSize[poolId], block.timestamp);
 
-        if (skipSync[poolId] || epochSynced[poolId][timestamp]) {
+        if (skipSync[poolId] || epochSynced[poolId][epochTimestamp]) {
             // Already synced for this epoch or syncing is disabled
             return;
         }
@@ -191,13 +193,18 @@ contract LiquidityBootstrappingHooks is BaseHook {
         LiquidityInfo memory liquidityInfo_ = liquidityInfo[poolId];
         bool isToken0 = liquidityInfo_.isToken0;
 
-        uint256 targetLiquidity = _getTargetLiquidity(poolId, timestamp);
+        uint256 targetLiquidity = _getTargetLiquidity(poolId, epochTimestamp);
         uint256 amountToProvide = targetLiquidity - amountProvided[poolId];
 
         amountProvided[poolId] = targetLiquidity;
 
         (, int24 tick,,,,) = poolManager.getSlot0(poolId);
-        int24 targetMinTick = _getTargetMinTick(poolId, timestamp);
+        int24 targetMinTick = _getTargetMinTick(poolId, epochTimestamp);
+
+        // @hung:
+        // targetLiquidty will increase over time, so the amountToProvide will increase over time
+        // targetMinTick will decrease over time, so the tick will decrease over time
+        // so as time passed, we have more liquidity and smaller tick => price will drop
 
         if (isToken0 && tick < targetMinTick || !isToken0 && tick > targetMinTick) {
             // Current tick is below target minimum tick
@@ -215,10 +222,12 @@ contract LiquidityBootstrappingHooks is BaseHook {
 
             // Swap
             skipSync[poolId] = true; // Skip beforeSwap hook logic to avoid infinite loop
+            // @hung: when call swap, it would invoke beforeSwap hook => which then invoke sync again
+            // so skipSync would avoid infinite loop
             _swap(
                 key,
                 IPoolManager.SwapParams(
-                    liquidityInfo_.isToken0,
+                    liquidityInfo_.isToken0, // @hung: zeroForOne, if token0 is bootstrapping token the swap is for token1 ??? must be vice versa
                     int256(amountToProvide),
                     TickMath.getSqrtRatioAtTick(isToken0 ? targetMinTick - 1 : -targetMinTick + 1)
                 )
@@ -226,6 +235,7 @@ contract LiquidityBootstrappingHooks is BaseHook {
             skipSync[poolId] = false;
 
             // amountSwapped = token balance before - token balance after
+            // get number of swapped amount
             amountSwapped -= _getTokenBalance(key);
 
             if (amountSwapped < amountToProvide) {
@@ -233,7 +243,7 @@ contract LiquidityBootstrappingHooks is BaseHook {
             }
         }
 
-        epochSynced[poolId][timestamp] = true;
+        epochSynced[poolId][epochTimestamp] = true;
     }
 
     /// @notice Withdraw LBP liquidity to pool owner
@@ -325,6 +335,8 @@ contract LiquidityBootstrappingHooks is BaseHook {
     /// @param poolId Pool ID
     /// @param timestamp Epoch floored timestamp
     /// @return Target minimum tick
+    // @hung targetMinTick will decrease over time. as the timeElapsed increase, the numerator will increase, so the targetMinTick will decrease
+    // @hung targetMinTick decrease mean the price would drop over time
     function _getTargetMinTick(PoolId poolId, uint256 timestamp) internal view returns (int24) {
         LiquidityInfo memory liquidityInfo_ = liquidityInfo[poolId];
 
@@ -353,6 +365,7 @@ contract LiquidityBootstrappingHooks is BaseHook {
     /// @param poolId Pool ID
     /// @param timestamp Epoch floored timestamp
     /// @return Target liquidity
+    // @hung the target liquidity amount will increase over time
     function _getTargetLiquidity(PoolId poolId, uint256 timestamp) internal view returns (uint256) {
         LiquidityInfo memory liquidityInfo_ = liquidityInfo[poolId];
 
