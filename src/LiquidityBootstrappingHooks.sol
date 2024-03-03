@@ -13,6 +13,7 @@ import {Currency, CurrencyLibrary} from "@uniswap/v4-core/contracts/types/Curren
 import {BalanceDelta} from "@uniswap/v4-core/contracts/types/BalanceDelta.sol";
 // TODO: Import from v4-periphery once it's merged
 import {LiquidityAmounts} from "./lib/LiquidityAmounts.sol";
+import "forge-std/console2.sol";
 
 error InvalidTimeRange();
 error InvalidTickRange();
@@ -145,11 +146,26 @@ contract LiquidityBootstrappingHooks is BaseHook {
         owner[poolId] = sender;
 
         // Transfer bootstrapping token to this contract
+        uint256 senderBalanceBefore = getProjectTokenBalance(key, sender);
+        uint256 lbpBalanceBefore = getProjectTokenBalance(key, address(this));
+        uint256 poolManagerBalanceBefore = getProjectTokenBalance(key, address(poolManager));
         if (data_.liquidityInfo_.isToken0) {
             ERC20(Currency.unwrap(key.currency0)).transferFrom(sender, address(this), data_.liquidityInfo_.totalAmount);
         } else {
             ERC20(Currency.unwrap(key.currency1)).transferFrom(sender, address(this), data_.liquidityInfo_.totalAmount);
         }
+
+        uint256 senderBalanceAfter = getProjectTokenBalance(key, sender);
+        uint256 lbpBalanceAfter = getProjectTokenBalance(key, address(this));
+        uint256 poolManagerBalanceAfter = getProjectTokenBalance(key, address(poolManager));
+
+        console2.log("afterInitialize|senderBalanceBefore: ", senderBalanceBefore);
+        console2.log("afterInitialize|lbpBalanceBefore: ", lbpBalanceBefore);
+        console2.log("afterInitialize|poolManagerBalanceBefore: ", poolManagerBalanceBefore);
+
+        console2.log("afterInitialize|senderBalanceAfter: ", senderBalanceAfter);
+        console2.log("afterInitialize|lbpBalanceAfter: ", lbpBalanceAfter);
+        console2.log("afterInitialize|poolManagerBalanceAfter: ", poolManagerBalanceAfter);
 
         return LiquidityBootstrappingHooks.afterInitialize.selector;
     }
@@ -170,8 +186,23 @@ contract LiquidityBootstrappingHooks is BaseHook {
             // allow swapping as usual
             return LiquidityBootstrappingHooks.beforeSwap.selector;
         }
+        string memory projectTokenName = ERC20(Currency.unwrap(key.currency0)).name();
+        uint256 lbpBalanceBefore = getProjectTokenBalance(key, address(this));
+        uint256 poolManagerBalanceBefore = getProjectTokenBalance(key, address(poolManager));
+        bool isSkipSync = skipSync[poolId];
+        if (!isSkipSync) {
+            console2.log("beforeSwap|", projectTokenName, "|lbpBalanceBefore: ", lbpBalanceBefore);
+            console2.log("beforeSwap|", projectTokenName, "|poolManagerBalanceBefore: ", poolManagerBalanceBefore);
+        }
 
         sync(key);
+
+        uint256 lbpBalanceAfter = getProjectTokenBalance(key, address(this));
+        uint256 poolManagerBalanceAfter = getProjectTokenBalance(key, address(poolManager));
+        if (!isSkipSync) {
+            console2.log("beforeSwap|", projectTokenName, "|lbpBalanceAfter: ", lbpBalanceAfter);
+            console2.log("beforeSwap|", projectTokenName, "|poolManagerBalanceAfter: ", poolManagerBalanceAfter);
+        }
 
         return LiquidityBootstrappingHooks.beforeSwap.selector;
     }
@@ -205,11 +236,19 @@ contract LiquidityBootstrappingHooks is BaseHook {
         // targetLiquidty will increase over time, so the amountToProvide will increase over time
         // targetMinTick will decrease over time, so the tick will decrease over time
         // so as time passed, we have more liquidity and smaller tick => price will drop
-
         if (isToken0 && tick < targetMinTick || !isToken0 && tick > targetMinTick) {
+            /*
+            Ex:
+                - isToken0: (token0 is project token): ----0-----tick----targetMinTick----------maxTick-----
+                    tick < targetMinTick meaning the price is lower than the target lowest price
+                - !isToken0: (token1 is project token): ----maxTick----targetMinTick-------tick--------0------
+                    tick > targetMinTick meaning the price is lower than the target lowest price
+                    because the price is inverted
+            **/
             // Current tick is below target minimum tick
             // Update liquidity range to [targetMinTick, maxTick]
             // and provide additional liquidity according to target liquidity
+            // replacePosition will remove current liquidity and provide new liquidity
             _replacePosition(key, liquidityInfo_, amountToProvide, targetMinTick);
         } else {
             // Current tick is above target minimum tick
@@ -299,10 +338,15 @@ contract LiquidityBootstrappingHooks is BaseHook {
         int24 currentMinTick_ = currentMinTick[poolId];
         int24 currentTickLower = isToken0 ? currentMinTick_ : -liquidityInfo_.maxTick;
         int24 currentTickUpper = isToken0 ? liquidityInfo_.maxTick : -currentMinTick_;
-
         int24 newTickLower = isToken0 ? targetMinTick : -liquidityInfo_.maxTick;
         int24 newTickUpper = isToken0 ? liquidityInfo_.maxTick : -targetMinTick;
 
+        /**
+         * Ex:
+         * (token0 is project token): ----0-----newTickLower----currentTickLower----------currentTickUpper/newTickUpper-----
+         * (token1 is project token): ----currentTickLower/newTickLower----currentTickUpper-------newTickUpper--------0------
+         *      currentMinTick > targetMinTick
+         */
         // Update liquidity range to [targetMinTick, maxTick]
         // and provide additional liquidity according to target liquidity
         Position.Info memory position =
@@ -368,7 +412,8 @@ contract LiquidityBootstrappingHooks is BaseHook {
     // @hung the target liquidity amount will increase over time
     function _getTargetLiquidity(PoolId poolId, uint256 timestamp) internal view returns (uint256) {
         LiquidityInfo memory liquidityInfo_ = liquidityInfo[poolId];
-
+        console2.log("targetMinTick|liquidityInfo_.startTime: ", liquidityInfo_.startTime);
+        console2.log("targetMinTick|timestamp: ", timestamp);
         if (timestamp < uint256(liquidityInfo_.startTime)) revert BeforeStartTime();
 
         if (timestamp >= uint256(liquidityInfo_.endTime)) return liquidityInfo_.totalAmount;
@@ -519,10 +564,36 @@ contract LiquidityBootstrappingHooks is BaseHook {
 
             BalanceDelta delta = poolManager.modifyPosition(callback.key, callback.params, bytes(""));
 
+            int256 delta0 = delta.amount0();
+            int256 delta1 = delta.amount1();
+            PoolKey memory key = callback.key;
+            console2.log("modifyPosition|delta|amount0: ", int256(delta.amount0()));
+            console2.log("modifyPosition|delta|amount1: ", int256(delta.amount1()));
+            string memory token0Name = ERC20(Currency.unwrap(key.currency0)).name();
+            string memory token1Name = ERC20(Currency.unwrap(key.currency1)).name();
             if (callback.params.liquidityDelta < 0) {
+                string memory takeTo = callback.takeToOwner ? "owner" : "poolManager";
+                if (delta0 < 0) {
+                    console2.log(
+                        "modifyPosition|takes|", string(abi.encodePacked(takeTo, token0Name)), ":", uint256(-delta0)
+                    );
+                }
+
+                if (delta1 < 0) {
+                    console2.log(
+                        "modifyPosition|takes|", string(abi.encodePacked(takeTo, token1Name)), ":", uint256(-delta1)
+                    );
+                }
                 // Removing liquidity, take tokens from the poolManager
                 _takeDeltas(callback.key, delta, callback.takeToOwner); // Take to owner if specified (exit)
             } else {
+                if (delta0 > 0) {
+                    console2.log("modifyPosition|settle|toPoolManager|", token0Name, ":", uint256(delta0));
+                }
+
+                if (delta1 > 0) {
+                    console2.log("modifyPosition|settle|toPoolManager|", token1Name, ":", uint256(delta1));
+                }
                 // Adding liquidity, settle tokens to the poolManager
                 _settleDeltas(callback.key, delta);
             }
@@ -534,14 +605,46 @@ contract LiquidityBootstrappingHooks is BaseHook {
             SwapCallback memory callback = abi.decode(data[32:], (SwapCallback));
 
             BalanceDelta delta = poolManager.swap(callback.key, callback.params, bytes(""));
-
+            console2.log("swap|delta|amount0: ", int256(delta.amount0()));
+            console2.log("swap|delta|amount1: ", int256(delta.amount1()));
             // Take and settle deltas
+            int256 delta0 = delta.amount0();
+            int256 delta1 = delta.amount1();
+            PoolKey memory key = callback.key;
+            string memory token0Name = ERC20(Currency.unwrap(key.currency0)).name();
+            string memory token1Name = ERC20(Currency.unwrap(key.currency1)).name();
+
+            if (delta0 < 0) {
+                console2.log("swap|takes|toOwner|", token0Name, ":", uint256(-delta0));
+            }
+
+            if (delta1 < 0) {
+                console2.log("swap|takes|toOwner|", token1Name, ":", uint256(-delta1));
+            }
             _takeDeltas(callback.key, delta, true); // Take tokens to the owner
+
+            if (delta0 > 0) {
+                console2.log("swap|settle|toPoolManager|", token0Name, ":", uint256(delta0));
+            }
+
+            if (delta1 > 0) {
+                console2.log("swap|settle|toPoolManager|", token1Name, ":", uint256(delta1));
+            }
             _settleDeltas(callback.key, delta);
 
             return abi.encode(delta);
         }
 
         return bytes("");
+    }
+
+    function getProjectTokenBalance(PoolKey calldata key, address target) public view returns (uint256) {
+        PoolId poolId = key.toId();
+        LiquidityInfo memory info = liquidityInfo[poolId];
+        if (info.isToken0) {
+            return ERC20(Currency.unwrap(key.currency0)).balanceOf(target);
+        } else {
+            return ERC20(Currency.unwrap(key.currency1)).balanceOf(target);
+        }
     }
 }
